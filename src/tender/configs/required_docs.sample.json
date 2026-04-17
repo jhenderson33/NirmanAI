@@ -1,0 +1,9 @@
+[
+  {"doc_type": "solicitation", "min_count": 1},
+  {"doc_type": "amendment", "min_count": 1},
+  {"doc_type": "sf1442", "min_count": 1},
+  {"doc_type": "pricing", "min_count": 1},
+  {"doc_type": "contract", "min_count": 1},
+  {"doc_type": "wage_determination", "min_count": 1}
+]
+

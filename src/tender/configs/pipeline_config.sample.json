@@ -1,0 +1,5 @@
+{
+  "convert_office_docs": false,
+  "required_rules_path": "src/tender/configs/required_docs.sample.json"
+}
+
