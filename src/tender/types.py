@@ -14,6 +14,7 @@ class DocumentRecord:
     section: str = "99_Appendix"
     sort_key: int = 999
     rendered_pdf: str = ""
+    classification_source: str = "unmatched"  # "filename" | "content" | "unmatched"
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

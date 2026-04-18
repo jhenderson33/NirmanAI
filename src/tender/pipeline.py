@@ -1,6 +1,5 @@
 from pathlib import Path
 
-from .assemble import assemble_binder
 from .classify import classify
 from .config import PipelineConfig, load_required_rules
 from .extract import extract_all
@@ -32,17 +31,10 @@ def run_pipeline(
 
     summary = generate_summary(records, solicitation_id, validation, out_dir)
 
-    assembly = assemble_binder(
-        records,
-        binder_pdf_path=str(Path(out_dir) / solicitation_id / "binder_master.pdf"),
-        index_md_path=str(Path(out_dir) / solicitation_id / "binder_index.md"),
-    )
-
-    manifest = publish(records, validation, assembly, out_dir, solicitation_id)
+    manifest = publish(records, validation, out_dir, solicitation_id)
 
     write_json(build_dir / "inventory.json", [r.to_dict() for r in records])
     write_json(build_dir / "validation_report.json", validation)
-    write_json(build_dir / "assembly_report.json", assembly)
     write_json(build_dir / "summary_report.json", summary)
 
     return manifest

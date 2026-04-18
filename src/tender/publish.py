@@ -5,7 +5,7 @@ from .types import DocumentRecord
 from .utils import write_json
 
 
-def publish(records: list[DocumentRecord], validation: dict, assembly: dict, out_dir: str, solicitation_id: str) -> dict:
+def publish(records: list[DocumentRecord], validation: dict, out_dir: str, solicitation_id: str) -> dict:
     base = Path(out_dir) / solicitation_id
     pack = base / "submission_pack"
     pack.mkdir(parents=True, exist_ok=True)
@@ -24,7 +24,6 @@ def publish(records: list[DocumentRecord], validation: dict, assembly: dict, out
         "solicitation_id": solicitation_id,
         "documents": [r.to_dict() for r in records],
         "validation": validation,
-        "assembly": assembly,
         "submission_pack": str(pack.resolve()),
         "documents_copied": copied,
     }

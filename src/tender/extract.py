@@ -153,6 +153,66 @@ def _is_temp_file(filename: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Content-based classification
+# ---------------------------------------------------------------------------
+
+# Patterns scanned against the first ~2 000 chars of extracted text.
+# Each entry: (regex, doc_type)  — first match wins.
+_CONTENT_RULES: list[tuple[str, str]] = [
+    (r"drawing\s+index|sheet\s+index|revision\s+history.*dwg|drawing\s+list", "drawings"),
+    (r"(?:section|div(?:ision)?)\s+0?1\s+\d{2}\s+\d{2}|project\s+manual|table\s+of\s+contents.*division", "solicitation"),
+    (r"statement\s+of\s+work|scope\s+of\s+work|performance\s+work\s+statement", "solicitation"),
+    (r"wage\s+determination|davis.bacon|service\s+contract\s+act", "wage_determination"),
+    (r"amendment\s+(?:no\.?|number)?\s*\d+|this\s+amendment\s+modifies", "amendment"),
+    (r"solicitation\s+(?:no\.?|number)|request\s+for\s+(?:proposal|quotation|bid)", "solicitation"),
+    (r"past\s+performance\s+questionnaire|ppq", "past_performance"),
+    (r"subcontracting\s+plan", "subcontracting_plan"),
+    (r"infection\s+control\s+risk|pre.?construction\s+risk\s+assessment", "admin"),
+    (r"site\s+visit\s+(?:sign|instructions)|attendance\s+sheet", "admin"),
+    (r"questions?\s+and\s+answers|technical\s+questions?\s+(?:and\s+)?responses?", "admin"),
+]
+
+# RAG strategy by doc_type
+_RAG_STRATEGY: dict[str, str] = {
+    "drawings":            "reference_only",   # huge, coordinate-heavy, not narrative
+    "unknown":             "reference_only",   # unclassified — don't surface by default
+    "solicitation":        "full",
+    "amendment":           "full",
+    "sf1442":              "full",
+    "pricing":             "full",
+    "contract":            "full",
+    "wage_determination":  "full",
+    "past_performance":    "full",
+    "bonding":             "full",
+    "subcontracting_plan": "full",
+    "admin":               "full",
+    "tender_summary":      "full",
+}
+
+
+def _content_classify(text: str, pages_meta: list[dict]) -> str | None:
+    """
+    Try to infer doc_type from extracted text and page dimensions.
+    Returns a doc_type string, or None if no confident match.
+    """
+    # Landscape-majority heuristic: drawing sets are almost always wider than tall
+    if pages_meta:
+        landscape_count = sum(
+            1 for p in pages_meta if p.get("width", 0) > p.get("height", 0)
+        )
+        if landscape_count / len(pages_meta) > 0.6:
+            return "drawings"
+
+    # Text pattern scan on first 2 000 chars
+    snippet = text[:2000].lower()
+    for pattern, doc_type in _CONTENT_RULES:
+        if re.search(pattern, snippet):
+            return doc_type
+
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -183,23 +243,28 @@ def extract_all(
         amend_no = _amendment_number(rec.filename) if rec.doc_type == "amendment" else None
 
         meta: dict = {
-            "solicitation_id":      solicitation_id,
-            "filename":             rec.filename,
-            "rel_path":             rec.rel_path,
-            "sha256":               rec.sha256,
-            "size_bytes":           rec.size_bytes,
-            "doc_type":             rec.doc_type,
-            "section":              rec.section,
-            "sort_key":             rec.sort_key,
-            "amendment_no":         amend_no,
-            "is_latest_amendment":  amend_no is not None and amend_no == max_amendment,
-            "extraction_method":    None,
-            "total_pages":          None,
-            "total_chars":          None,
-            "has_extractable_text": False,
-            "pages":                [],
-            "dify_doc_name":        f"[{rec.doc_type.upper()}] {rec.filename}",
-            "dify_tags":            [rec.doc_type, solicitation_id, rec.section],
+            "solicitation_id":        solicitation_id,
+            "filename":               rec.filename,
+            "rel_path":               rec.rel_path,
+            "sha256":                 rec.sha256,
+            "size_bytes":             rec.size_bytes,
+            "doc_type":               rec.doc_type,
+            "section":                rec.section,
+            "sort_key":               rec.sort_key,
+            "amendment_no":           amend_no,
+            "is_latest_amendment":    amend_no is not None and amend_no == max_amendment,
+            "extraction_method":      None,
+            "total_pages":            None,
+            "total_chars":            None,
+            "has_extractable_text":   False,
+            "pages":                  [],
+            # ── new classification fields ──────────────────────────────────
+            "classification_source":  rec.classification_source,   # filename | content | unmatched
+            "content_classification": None,   # filled in after extraction
+            "rag_strategy":           None,   # filled in after extraction
+            # ──────────────────────────────────────────────────────────────
+            "dify_doc_name":          f"[{rec.doc_type.upper()}] {rec.filename}",
+            "dify_tags":              [rec.doc_type, solicitation_id, rec.section],
         }
 
         text = ""
@@ -233,6 +298,30 @@ def extract_all(
 
         else:
             meta["extraction_method"] = "unsupported_format"
+
+        # ── Content-based classification override ─────────────────────────
+        if rec.ext == ".pdf" and meta["has_extractable_text"]:
+            content_type = _content_classify(text, meta["pages"])
+            meta["content_classification"] = content_type
+
+            if content_type and content_type != meta["doc_type"]:
+                # Content signal wins over an unmatched filename; also
+                # always trust the landscape/drawings signal regardless.
+                if meta["classification_source"] == "unmatched" or content_type == "drawings":
+                    meta["doc_type"] = content_type
+                    meta["classification_source"] = "content"
+                    # Re-derive section for drawings
+                    if content_type == "drawings":
+                        meta["section"] = "11_Drawings"
+                    # Update dify fields to reflect new doc_type
+                    meta["dify_doc_name"] = f"[{content_type.upper()}] {rec.filename}"
+                    meta["dify_tags"][0] = content_type
+            elif content_type:
+                # Content agreed with filename classification
+                meta["content_classification"] = content_type
+
+        # ── RAG strategy ──────────────────────────────────────────────────
+        meta["rag_strategy"] = _RAG_STRATEGY.get(meta["doc_type"], "full")
 
         (section_dir / f"{stem}.txt").write_text(text, encoding="utf-8")
         (section_dir / f"{stem}.meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")

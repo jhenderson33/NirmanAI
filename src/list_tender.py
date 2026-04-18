@@ -1,8 +1,11 @@
+import argparse
 import requests
 import os
 import time
 import re
 import json
+from datetime import datetime
+from pathlib import Path
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -11,25 +14,43 @@ API_KEY = os.environ.get("SAM_KEY")
 if not API_KEY:
     raise EnvironmentError("SAM_KEY environment variable is not set.")
 KNOWLEDGE_BASE_DIR = os.path.join(os.getcwd(), "knowledge_base")
-DOWNLOAD_DELAY_SECONDS = 2   # polite pause between file downloads
-DEBUG_PRINT_JSON = False      # set to True to dump the full API response JSON
+RESULTS_DIR        = os.path.join(os.getcwd(), "search_results")
+DOWNLOAD_DELAY_SECONDS = 2
+DEBUG_PRINT_JSON = False
 
 # ---------------------------------------------------------------------------
-# SAM.gov search endpoint
+# CLI args
 # ---------------------------------------------------------------------------
-url = "https://api.sam.gov/opportunities/v2/search"
+parser = argparse.ArgumentParser(description="List (and optionally download) SAM.gov tenders")
+parser.add_argument(
+    "--download",
+    action="store_true",
+    default=False,
+    help="Actually download attachment files to knowledge_base/. "
+         "Omit this flag to list only (no API download calls made).",
+)
+args = parser.parse_args()
+DOWNLOAD_ENABLED = args.download
 
-params = {
-    "api_key": API_KEY,
-    "postedFrom": "03/11/2026",
-    "postedTo": "04/11/2026",
-    "state": "CA",
-    "ncode": "236220",   # NAICS 236220 – Commercial & Institutional Building Construction
-    "limit": 5,
-    "ptype": "s",                    # s = Solicitation (Open for bid)
-    "active": "Yes",                 # Eliminates archived/closed projects
+# ---------------------------------------------------------------------------
+# SAM.gov search  – TWO requests total (one per notice type)
+# Client-side NAICS filter keeps only genuine construction results.
+# ---------------------------------------------------------------------------
+BASE_URL = "https://api.sam.gov/opportunities/v2/search"
+
+BASE_PARAMS = {
+    "api_key":      API_KEY,
+    "postedFrom":   "03/17/2026",
+    "postedTo":     "04/17/2026",
+    "keyword":      "construction",   # broad keyword, no state/NAICS restriction
+    "limit":        1000,
+    "active":       "Yes",
     "includeCount": "true",
+    # No "state" — nationwide
+    # No "ncode" — all NAICS
+    # No "ptype" — all notice types (solicitation, combined synopsis, etc.)
 }
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -160,119 +181,179 @@ def download_file(url: str, dest_path: str, api_key: str) -> tuple:
 # Main
 # ---------------------------------------------------------------------------
 
-# Ensure the knowledge_base folder exists
-os.makedirs(KNOWLEDGE_BASE_DIR, exist_ok=True)
-print(f"📁  Knowledge base directory: {KNOWLEDGE_BASE_DIR}\n")
+if DOWNLOAD_ENABLED:
+    os.makedirs(KNOWLEDGE_BASE_DIR, exist_ok=True)
+    print(f"📁  Knowledge base directory: {KNOWLEDGE_BASE_DIR}\n")
+else:
+    print("ℹ️   List-only mode. Use --download to save files to knowledge_base/.\n")
 
-summary_rows = []   # one entry per tender
+summary_rows = []
 
 try:
-    response = requests.get(url, params=params)
+    # Single API request — no ptype, state, or NAICS filter
+    print(f"🔍  Querying SAM.gov (1 request, nationwide, keyword=construction) …")
+    resp = requests.get(BASE_URL, params=BASE_PARAMS)
+    if resp.status_code != 200:
+        raise RuntimeError(f"Query failed (HTTP {resp.status_code}): {resp.text[:300]}")
 
-    if response.status_code != 200:
-        print(f"Failed to retrieve data. Status Code: {response.status_code}")
-        print(response.text)
-    else:
-        data = response.json()
+    batch = resp.json().get("opportunitiesData", [])
+    seen_ids: set[str] = set()
+    opportunities: list[dict] = []
+    for opp in batch:
+        uid = opp.get("noticeId") or opp.get("solicitationNumber", "")
+        if uid and uid not in seen_ids:
+            seen_ids.add(uid)
+            opportunities.append(opp)
 
-        if DEBUG_PRINT_JSON:
-            print("DEBUG – full API response JSON:")
-            print(json.dumps(data, indent=2))
-            print("-" * 60 + "\n")
+    print(f"    → {len(batch)} returned, {len(opportunities)} unique")
 
-        opportunities = data.get("opportunitiesData", [])
-        print(f"Found {len(opportunities)} tender(s).\n{'=' * 60}\n")
+    # Sort: NAICS code ascending, then doc count descending within each NAICS
+    opportunities.sort(key=lambda o: (
+        str(o.get("naicsCode") or "999999"),
+        -len(collect_download_links(o)),
+    ))
 
-        for opportunity in opportunities:
-            title              = opportunity.get("title", "N/A")
-            agency             = opportunity.get("fullParentPathName") or opportunity.get("agency") or opportunity.get("departmentName", "N/A")
-            solicitation_number = opportunity.get("solicitationNumber") or opportunity.get("noticeId", "UNKNOWN")
-            posted_date        = opportunity.get("postedDate", "N/A")
-            response_deadline  = opportunity.get("responseDeadLine", "N/A")
-            notice_type        = opportunity.get("type", "N/A")
-            description        = (opportunity.get("description") or "")[:200]  # first 200 chars
+    if DEBUG_PRINT_JSON:
+        print(json.dumps(opportunities, indent=2))
 
-            print(f"📋  {title}")
-            print(f"    Agency       : {agency}")
-            print(f"    Solicitation : {solicitation_number}")
-            print(f"    Posted       : {posted_date}")
-            print(f"    Deadline     : {response_deadline}")
+    print(f"\nFound {len(opportunities)} construction tender(s).\n{'=' * 60}\n")
 
-            # --- create subfolder ---
-            folder_name = sanitize_folder_name(solicitation_number)
-            tender_dir  = os.path.join(KNOWLEDGE_BASE_DIR, folder_name)
+    # ── Build Markdown output ─────────────────────────────────────────────
+    timestamp   = datetime.now().strftime("%Y-%m-%d_%H%M")
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+    md_path     = os.path.join(RESULTS_DIR, f"tenders_{timestamp}.md")
+    md_lines: list[str] = [
+        f"# SAM.gov Construction Tenders — Nationwide",
+        f"",
+        f"**Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M')}  ",
+        f"**Date range:** {BASE_PARAMS['postedFrom']} → {BASE_PARAMS['postedTo']}  ",
+        f"**Keyword:** `construction`  ",
+        f"**Total results:** {len(opportunities)}  ",
+        f"**Sorted by:** NAICS code ↑, then document count ↓  ",
+        f"",
+        f"---",
+        f"",
+    ]
+
+    for opportunity in opportunities:
+        title               = opportunity.get("title", "N/A")
+        agency              = opportunity.get("fullParentPathName") or opportunity.get("agency") or opportunity.get("departmentName", "N/A")
+        solicitation_number = opportunity.get("solicitationNumber") or opportunity.get("noticeId", "UNKNOWN")
+        posted_date         = opportunity.get("postedDate", "N/A")
+        response_deadline   = opportunity.get("responseDeadLine", "N/A")
+        notice_type         = opportunity.get("type", "N/A")
+        naics_code          = opportunity.get("naicsCode", "N/A")
+        state               = (opportunity.get("placeOfPerformance") or {}).get("state", {}).get("code", "N/A")
+        description         = (opportunity.get("description") or "")[:200]
+
+        links = collect_download_links(opportunity)
+
+        # Console output
+        print(f"📋  {title}")
+        print(f"    Agency       : {agency}")
+        print(f"    Solicitation : {solicitation_number}")
+        print(f"    NAICS        : {naics_code}  |  State: {state}")
+        print(f"    Posted       : {posted_date}")
+        print(f"    Deadline     : {response_deadline}")
+        print(f"    Documents    : {len(links)} link(s) found")
+        for idx, link_info in enumerate(links, start=1):
+            print(f"      [{idx:>2}] {link_info['filename']}")
+            print(f"            {link_info['url']}")
+
+        # Markdown output
+        md_lines += [
+            f"## {title}",
+            f"",
+            f"| Field | Value |",
+            f"|---|---|",
+            f"| **Solicitation #** | `{solicitation_number}` |",
+            f"| **Notice type** | {notice_type} |",
+            f"| **NAICS** | {naics_code} |",
+            f"| **State** | {state} |",
+            f"| **Agency** | {agency} |",
+            f"| **Posted** | {posted_date} |",
+            f"| **Deadline** | {response_deadline} |",
+        ]
+        if description:
+            md_lines += [f"| **Description** | {description}{'…' if len(description) == 200 else ''} |"]
+        md_lines.append("")
+
+        if links:
+            md_lines.append(f"**Documents ({len(links)}):**")
+            md_lines.append("")
+            for idx, link_info in enumerate(links, start=1):
+                md_lines.append(f"{idx}. [{link_info['filename']}]({link_info['url']})")
+            md_lines.append("")
+        else:
+            md_lines.append("_No attachment links found._")
+            md_lines.append("")
+
+        md_lines.append("---")
+        md_lines.append("")
+
+        # Download flow
+        folder_name      = sanitize_folder_name(solicitation_number)
+        tender_dir       = os.path.join(KNOWLEDGE_BASE_DIR, folder_name)
+        files_downloaded = 0
+        total_bytes      = 0
+
+        if DOWNLOAD_ENABLED and links:
+            print()
             os.makedirs(tender_dir, exist_ok=True)
-
-            # --- gather links and download ---
-            links = collect_download_links(opportunity)
-            print(f"    Documents    : {len(links)} link(s) found")
-
-            files_downloaded = 0
-            total_bytes      = 0
-
             for idx, link_info in enumerate(links, start=1):
                 dest_filename = sanitize_folder_name(link_info["filename"]) or f"document_{idx}"
                 dest_path     = os.path.join(tender_dir, dest_filename)
-
-                print(f"      ↓ [{idx}/{len(links)}] {link_info['url']}")
+                print(f"      ↓ [{idx}/{len(links)}] downloading {link_info['filename']} …")
                 bytes_written, saved_name = download_file(link_info["url"], dest_path, API_KEY)
-
                 if bytes_written:
                     files_downloaded += 1
                     total_bytes      += bytes_written
                     print(f"         ✔  Saved {human_readable_size(bytes_written)} → {saved_name}")
-
-                # polite delay between downloads
                 if idx < len(links):
                     time.sleep(DOWNLOAD_DELAY_SECONDS)
+            print(f"    ✅  Downloaded {files_downloaded} file(s) ({human_readable_size(total_bytes)})\n")
+        else:
+            print(f"    ℹ️   Run with --download to fetch these files.\n")
 
-            print(f"    ✅  Downloaded {files_downloaded} file(s) "
-                  f"({human_readable_size(total_bytes)})\n")
+        summary_rows.append({
+            "title":             title,
+            "agency":            agency,
+            "solicitation":      solicitation_number,
+            "naics":             naics_code,
+            "posted":            posted_date,
+            "deadline":          response_deadline,
+            "notice_type":       notice_type,
+            "description":       description,
+            "links_found":       len(links),
+            "files_downloaded":  files_downloaded,
+            "total_bytes":       total_bytes,
+        })
 
-            summary_rows.append({
-                "title":             title,
-                "agency":            agency,
-                "solicitation":      solicitation_number,
-                "posted":            posted_date,
-                "deadline":          response_deadline,
-                "notice_type":       notice_type,
-                "description":       description,
-                "links_found":       len(links),
-                "files_downloaded":  files_downloaded,
-                "total_bytes":       total_bytes,
-            })
+    # Write Markdown file
+    Path(md_path).write_text("\n".join(md_lines), encoding="utf-8")
+    print(f"\n📄  Results saved to: {md_path}")
 
 except Exception as exc:
+    import traceback
     print(f"An error occurred: {exc}")
+    traceback.print_exc()
 
 # ---------------------------------------------------------------------------
-# Final summary
+# Console summary
 # ---------------------------------------------------------------------------
 if summary_rows:
     grand_files = sum(r["files_downloaded"] for r in summary_rows)
     grand_bytes = sum(r["total_bytes"]       for r in summary_rows)
 
     print("\n" + "=" * 70)
-    print("  DOWNLOAD SUMMARY")
+    print(f"  SUMMARY  —  {len(summary_rows)} tender(s) returned")
     print("=" * 70)
-
     for i, row in enumerate(summary_rows, start=1):
-        print(f"\n  [{i}] {row['title']}")
-        print(f"       Type          : {row['notice_type']}")
-        print(f"       Agency        : {row['agency']}")
-        print(f"       Solicitation  : {row['solicitation']}")
-        print(f"       Posted        : {row['posted']}")
-        print(f"       Deadline      : {row['deadline']}")
-        if row["description"]:
-            print(f"       Description   : {row['description']}{'…' if len(row['description']) == 200 else ''}")
-        print(f"       Links found   : {row['links_found']}")
-        print(f"       Files saved   : {row['files_downloaded']}")
-        print(f"       Storage used  : {human_readable_size(row['total_bytes'])}")
-        print(f"       Folder        : knowledge_base/{sanitize_folder_name(row['solicitation'])}")
-
-    print("\n" + "-" * 70)
-    print(f"  TOTAL  →  {grand_files} file(s) downloaded  |  "
-          f"{human_readable_size(grand_bytes)} total storage used")
+        doc_label = f"{row['links_found']} doc(s)"
+        print(f"  [{i:>2}] {row['title'][:60]}")
+        print(f"        {row['solicitation']}  |  NAICS {row['naics']}  |  {doc_label}  |  deadline {row['deadline']}")
+    if DOWNLOAD_ENABLED:
+        print(f"\n  Downloaded: {grand_files} file(s)  |  {human_readable_size(grand_bytes)}")
     print("=" * 70)
 else:
-    print("\nNo tenders were retrieved – nothing to summarise.")
+    print("\nNo construction tenders were retrieved.")

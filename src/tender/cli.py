@@ -26,15 +26,11 @@ def main() -> None:
         config=cfg,
     )
 
-    print("Binder pipeline complete")
+    print("Pipeline complete")
     print(f"- Manifest:        {os.path.join(args.out_dir, args.solicitation_id, 'binder_manifest.json')}")
     print(f"- Tender summary:  {os.path.join(args.out_dir, args.solicitation_id, 'tender_summary.md')}")
     print(f"- Extracted texts: {os.path.join(args.out_dir, args.solicitation_id, 'extracted')}")
     print(f"- Submission pack: {manifest['submission_pack']}")
-    if manifest.get("assembly", {}).get("binder_created"):
-        print(f"- Binder PDF:      {manifest['assembly'].get('binder_pdf')}")
-    else:
-        print(f"- Binder PDF skipped: {manifest.get('assembly', {}).get('reason', 'unknown reason')}")
 
 
 if __name__ == "__main__":
