@@ -60,6 +60,10 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--dry-run",     action="store_true", help="Print plan, make no API calls")
     parser.add_argument("--delay",       type=float, default=1.0,
                         help="Seconds between uploads (default 1)")
+    parser.add_argument("--pipeline",    action="store_true",
+                        help="Target a pipeline-configured dataset: upload via create-by-file "
+                             "and defer all chunking/indexing settings to the pipeline config. "
+                             "Use with --dataset-id.")
     return parser.parse_args()
 
 
@@ -152,19 +156,41 @@ class DifyClient:
 
     # ── Documents ───────────────────────────────────────────────────────────
 
-    def upload_document(self, dataset_id: str, name: str, text: str) -> dict:
-        """Upload a document by text. Returns the document object."""
-        body = {
-            "name":               name,
-            "text":               text,
-            "indexing_technique": "high_quality",
-            "process_rule": {
-                "mode": "automatic",
-            },
+    def upload_document(self, dataset_id: str, name: str, text: str,
+                        pipeline_mode: bool = False) -> dict:
+        """Upload a document by text (or file if pipeline_mode). Returns the document object."""
+        stem = Path(name).stem if name.lower().endswith((".pdf", ".docx", ".xlsx", ".doc", ".xls")) else name
+        safe_name = stem + ".txt"
+
+        if pipeline_mode:
+            # Send only the file — no process_rule or indexing_technique —
+            # so Dify applies the pipeline's own configured settings.
+            return self._upload_by_file(dataset_id, safe_name, text)
+        else:
+            body: dict = {
+                "name":               safe_name,
+                "text":               text,
+                "indexing_technique": "high_quality",
+                "process_rule":       {"mode": "automatic"},
+            }
+            data = self._post(f"/datasets/{dataset_id}/document/create-by-text", body)
+            return data.get("document", data)
+
+    def _upload_by_file(self, dataset_id: str, filename: str, text: str) -> dict:
+        """Upload text as a .txt file via multipart. No process_rule is sent,
+        so the dataset's pipeline configuration applies."""
+        files = {
+            "file": (filename, text.encode("utf-8"), "text/plain"),
         }
-        data = self._post(f"/datasets/{dataset_id}/document/create-by-text", body)
-        # Response shape: {"document": {...}, "batch": "..."}
-        return data.get("document", data)
+        r = requests.post(
+            f"{self.base_url}/datasets/{dataset_id}/document/create-by-file",
+            headers=self.headers,
+            files=files,
+            timeout=120,
+        )
+        r.raise_for_status()
+        result = r.json()
+        return result.get("document", result)
 
     def list_documents(self, dataset_id: str) -> list[dict]:
         """Return all documents in a dataset (handles pagination)."""
@@ -296,7 +322,11 @@ def main() -> None:
     print(f"  API base     : {base_url}")
     print(f"  dist dir     : {dist_dir}")
     print(f"  include all  : {args.include_all}")
-    print(f"  dry run      : {args.dry_run}\n")
+    print(f"  dry run      : {args.dry_run}")
+    print(f"  pipeline mode: {args.pipeline}\n")
+
+    # In pipeline mode, process_rule is intentionally omitted so Dify
+    # applies the dataset's own configured pipeline settings.
 
     # ── Discover documents ────────────────────────────────────────────────
     pairs = _load_doc_pairs(dist_dir, args.include_all)
@@ -368,7 +398,8 @@ def main() -> None:
 
         try:
             text = txt_path.read_text(encoding="utf-8")
-            doc  = client.upload_document(dataset_id, name, text)
+            doc  = client.upload_document(dataset_id, name, text,
+                                          pipeline_mode=args.pipeline)
             doc_id = doc.get("id") or doc.get("document", {}).get("id")
             if not doc_id:
                 raise ValueError(f"No document ID in response: {doc}")
@@ -386,6 +417,8 @@ def main() -> None:
 
     # ── Bulk-set metadata ─────────────────────────────────────────────────
     if uploaded:
+        print("⏳  Waiting 60s for Dify to finish indexing …")
+        time.sleep(60)
         print(f"🏷   Setting metadata on {len(uploaded)} document(s) …")
 
         META_KEYS = [name for name, _ in METADATA_SCHEMA]
@@ -402,13 +435,17 @@ def main() -> None:
             for key in META_KEYS:
                 val = _val(item["meta"], key)
                 if val is not None:
-                    meta_list.append({"id": field_id_map[key], "value": val})
+                    meta_list.append({"id": field_id_map[key], "name": key, "value": val})
             if meta_list:
                 operations.append({"document_id": item["document_id"], "metadata_list": meta_list})
 
         try:
             client.bulk_set_metadata(dataset_id, operations)
             print(f"    ✔  Metadata applied\n")
+        except requests.exceptions.HTTPError as exc:
+            print(f"    ⚠  Metadata bulk-update failed: {exc}")
+            print(f"    Response body: {exc.response.text}\n")
+            errors.append(f"metadata_bulk: {exc}")
         except Exception as exc:
             print(f"    ⚠  Metadata bulk-update failed: {exc}\n")
             errors.append(f"metadata_bulk: {exc}")
