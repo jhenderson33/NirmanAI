@@ -10,24 +10,34 @@ RAG-ready package for use with AI agents (e.g. Dify).
 ```
 NirmanAI/
 ├── knowledge_base/          # Downloaded tender folders (one subfolder per solicitation)
-│   └── sample/              # Example: RHC LPOE Design-Build solicitation
+│   ├── sample/              # Example: RHC LPOE Design-Build solicitation
+│   └── legal/               # Legal/regulatory reference documents (not included in repo for space)
 ├── src/
-│   ├── list_tender.py       # Search SAM.gov and download tender documents
+│   ├── list_tender.py       # Search SAM.gov for open construction solicitations; write results to Markdown
 │   ├── retrieve_tender.py   # Fetch a single tender by solicitation number
+│   ├── find_candidates.py   # Filter a saved search-results Markdown for strong download candidates
+│   ├── publish_dify.py      # Upload pipeline output (extracted .txt + metadata) to a Dify knowledge base
+│   ├── sync_metadata_dify.py# Sync .meta.json sidecar metadata onto already-uploaded Dify documents
 │   └── tender/              # Pipeline package (importable as `tender`)
+│       ├── __main__.py      # Entry point: `python -m tender …`
+│       ├── cli.py           # Argument parsing for the pipeline CLI
 │       ├── pipeline.py      # Orchestrator – calls all stages in order
 │       ├── ingest.py        # Stage 1: scan source folder → DocumentRecord list
-│       ├── classify.py      # Stage 2: regex-classify each file by doc_type
+│       ├── classify.py      # Stage 2: regex-classify each file by doc_type + section
 │       ├── normalize.py     # Stage 3: resolve PDF path (optional LibreOffice conversion)
 │       ├── extract.py       # Stage 4: extract text + write .txt/.meta.json sidecars
 │       ├── validate.py      # Stage 5: check required doc types are present
 │       ├── summarize.py     # Stage 6: generate tender_summary.md RAG anchor
 │       ├── publish.py       # Stage 7: copy originals into submission_pack/, write manifest
+│       ├── assemble.py      # (Legacy) unused assembler – retained for reference
 │       ├── config.py        # PipelineConfig dataclass + loader
 │       ├── types.py         # DocumentRecord dataclass
 │       ├── utils.py         # Shared helpers (sha256, write_json)
 │       └── configs/         # Example config files
+│           ├── pipeline_config.sample.json
+│           └── required_docs.sample.json
 ├── dist/                    # Pipeline output (git-ignored)
+├── search_results/          # Saved SAM.gov search Markdown files
 ├── tests/
 │   └── test_tender_smoke.py
 └── requirements.txt
@@ -85,11 +95,16 @@ uv pip install -r requirements.txt
 pip install -r requirements.txt
 ```
 
-### 2. Download tenders from SAM.gov
+### 2. Search SAM.gov for tenders
 
 ```bash
-export SAM_KEY="your-api-key"
-python src/list_tender.py          # searches and downloads to knowledge_base/
+export SAM_KEY="your-sam-api-key"
+python src/list_tender.py          # prints results + doc counts; writes Markdown to search_results/
+```
+
+To find strong candidates from a saved results file:
+```bash
+python src/find_candidates.py      # filters for construction-relevant solicitations with 10–30 docs
 ```
 
 ### 3. Run the pipeline
@@ -100,6 +115,20 @@ PYTHONPATH=src python -m tender \
   --out-dir dist \
   --solicitation-id sample \
   --config src/tender/configs/pipeline_config.sample.json
+```
+
+### 4. Publish to Dify
+
+Upload extracted text and metadata to a Dify knowledge base dataset:
+```bash
+export DIFY_API_KEY="your-dify-api-key"
+python src/publish_dify.py --dist-dir dist/sample --dataset-id <dataset-id>
+```
+
+If documents are already uploaded and you only need to sync metadata:
+```bash
+python src/sync_metadata_dify.py --dist-dir dist/sample --dataset-id <dataset-id>
+# Add --dry-run to preview matches without making API calls
 ```
 
 ---
