@@ -62,17 +62,30 @@ def build_summary(
     records: list[DocumentRecord],
     solicitation_id: str,
     validation: dict,
+    extracted_metas: dict | None = None,
 ) -> str:
-    """Return the full Markdown summary string."""
+    """Return the full Markdown summary string.
+
+    *extracted_metas* is an optional mapping of filename → meta dict loaded
+    from the extracted/<section>/<stem>.meta.json sidecars.  When supplied,
+    chunked documents are surfaced in the document index and a dedicated
+    "Oversized / Chunked Documents" section is emitted.
+    """
     groups = _group(records)
     latest_amend = _latest_amendment(records)
     generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     total_docs = len(records)
     total_bytes = sum(r.size_bytes for r in records)
 
-    extractable = [r for r in records if r.doc_type != "unknown"]
-    has_text = [r for r in records
-                if getattr(r, "has_extractable_text", False)]  # best-effort
+    meta_by_filename: dict[str, dict] = extracted_metas or {}
+
+    # Identify chunked documents
+    chunked: list[tuple[DocumentRecord, dict]] = [
+        (rec, meta_by_filename[rec.filename])
+        for rec in records
+        if rec.filename in meta_by_filename
+        and meta_by_filename[rec.filename].get("is_chunked")
+    ]
 
     lines: list[str] = []
 
@@ -97,6 +110,7 @@ def build_summary(
         f"| Total package size | {_fmt_size(total_bytes)} |",
         f"| Latest amendment | {'Amendment ' + str(latest_amend).zfill(3) if latest_amend else 'None detected'} |",
         f"| Validation status | {'✅ All required docs found' if validation.get('is_valid') else '⚠️ Missing required documents — see below'} |",
+        f"| Oversized docs (chunked) | {len(chunked)} — split for Dify 400 k limit |" if chunked else "| Oversized docs (chunked) | None |",
         f"| Summary generated | {generated_at} |",
         f"",
     ]
@@ -223,12 +237,84 @@ def build_summary(
         if rec.section != current_section:
             current_section = rec.section
             lines.append(f"### {current_section}")
+        rec_meta = meta_by_filename.get(rec.filename, {})
+        chunk_note = ""
+        if rec_meta.get("is_chunked"):
+            n = rec_meta.get("chunk_count", "?")
+            chunk_note = f" ⚠️ **split into {n} chunks for Dify**"
         lines.append(
             f"- `{rec.filename}` — **{rec.doc_type}** "
             f"| {_fmt_size(rec.size_bytes)} "
             f"| SHA256: `{rec.sha256[:12]}…`"
+            + chunk_note
         )
+        for chunk in rec_meta.get("chunks", []):
+            lines.append(
+                f"  - `{chunk['txt_file']}` — part {chunk['part']} | {chunk['chars']:,} chars"
+            )
     lines.append("")
+
+    # ── Drawings & reference-only documents ──────────────────────────────────
+    drawing_docs = groups.get("drawings", [])
+    # Also catch any other records flagged reference_only that aren't drawings
+    # (rag_strategy is on the record only after extraction; use doc_type as proxy)
+    reference_only_types = {"drawings"}
+    reference_docs = [
+        r for r in records
+        if r.doc_type in reference_only_types
+    ]
+    if reference_docs:
+        lines += [
+            "## Drawings & Reference Documents (Not in RAG Knowledge Base)",
+            "",
+            "The following documents are **excluded from the RAG knowledge base** because they",
+            "are drawing sets or large reference files that do not embed well as text chunks.",
+            "If you need to view these documents, download them directly from SAM.gov using",
+            f"solicitation number **`{solicitation_id}`**.",
+            "",
+            f"> 🔍 To find these files: go to [sam.gov](https://sam.gov), search for",
+            f"> solicitation `{solicitation_id}`, and download the attachments listed below.",
+            "",
+            "| Filename | Size | Type |",
+            "|---|---|---|",
+        ]
+        for rec in reference_docs:
+            lines.append(f"| `{rec.filename}` | {_fmt_size(rec.size_bytes)} | {rec.doc_type} |")
+        lines += [
+            "",
+            "**Note for RAG agent:** If a user asks about drawings, plans, or construction",
+            "details that would typically appear in a drawing set, inform them that drawings",
+            f"are available for download from SAM.gov under solicitation `{solicitation_id}`",
+            "but are not indexed in this knowledge base.",
+            "",
+        ]
+
+    # ── Oversized / chunked documents ────────────────────────────────────────
+    if chunked:
+        lines += [
+            "## ⚠️ Oversized Documents — Split for Dify",
+            "",
+            "The following documents exceeded the Dify 400,000-character limit and were",
+            "automatically split into numbered part files. **Upload the part files to Dify,",
+            "not the original `.txt` file.**",
+            "",
+            "| Original File | Doc Type | Total Chars | Parts |",
+            "|---|---|---|---|",
+        ]
+        for rec, m in chunked:
+            total_chars = sum(c["chars"] for c in m.get("chunks", []))
+            n_parts = m.get("chunk_count", "?")
+            lines.append(
+                f"| `{rec.filename}` | {rec.doc_type} | {total_chars:,} | {n_parts} |"
+            )
+        lines.append("")
+        for rec, m in chunked:
+            lines += [f"**`{rec.filename}` chunk files:**", ""]
+            for chunk in m.get("chunks", []):
+                lines.append(
+                    f"- `{chunk['txt_file']}` — part {chunk['part']} of {m['chunk_count']} | {chunk['chars']:,} chars"
+                )
+            lines.append("")
 
     # ── RAG usage notes ───────────────────────────────────────────────────────
     lines += [
@@ -251,6 +337,7 @@ def build_summary(
         "| Labor rates | `wage_determination` | Required for compliant estimates |",
         "| Bond requirements | `bonding` | Check solicitation for trigger thresholds |",
         "| Past performance | `past_performance` | PPQ to be completed and returned |",
+        "| Drawings / plans / construction details | N/A — not indexed | Direct user to SAM.gov solicitation `" + solicitation_id + "` to download drawing attachments |",
         "",
     ]
 
@@ -274,7 +361,20 @@ def generate_summary(
     base = Path(out_dir) / solicitation_id
     base.mkdir(parents=True, exist_ok=True)
 
-    md_content = build_summary(records, solicitation_id, validation)
+    # Load extracted meta sidecars so build_summary can surface chunk info
+    extracted_metas: dict[str, dict] = {}
+    extract_root = base / "extracted"
+    if extract_root.exists():
+        for meta_file in extract_root.rglob("*.meta.json"):
+            try:
+                m = json.loads(meta_file.read_text(encoding="utf-8"))
+                fname = m.get("filename")
+                if fname:
+                    extracted_metas[fname] = m
+            except Exception:
+                pass
+
+    md_content = build_summary(records, solicitation_id, validation, extracted_metas)
     # Plain text version: strip Markdown formatting minimally
     txt_content = md_content
 
@@ -294,6 +394,12 @@ def generate_summary(
                 n = int(m.group(1))
                 latest_amend = max(latest_amend or 0, n)
 
+    drawing_records = [r for r in records if r.doc_type == "drawings"]
+    chunked_records = [
+        r for r in records
+        if extracted_metas.get(r.filename, {}).get("is_chunked")
+    ]
+
     meta = {
         "solicitation_id":      solicitation_id,
         "doc_type":             "tender_summary",
@@ -301,6 +407,10 @@ def generate_summary(
         "sort_key":             0,
         "latest_amendment_no":  latest_amend,
         "total_docs_indexed":   len(records),
+        "drawings_excluded":    len(drawing_records),
+        "drawings_filenames":   [r.filename for r in drawing_records],
+        "chunked_docs":         len(chunked_records),
+        "chunked_filenames":    [r.filename for r in chunked_records],
         "is_valid":             validation.get("is_valid", False),
         "missing_required":     validation.get("missing_required", []),
         "generated_at":         datetime.now(timezone.utc).isoformat(),

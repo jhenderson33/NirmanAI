@@ -5,6 +5,9 @@ out/
 .kotlin
 .idea/
 
+### python ###
+__pycache__/
+
 ### Eclipse ###
 .apt_generated
 .classpath

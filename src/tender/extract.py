@@ -12,6 +12,8 @@ import re
 from pathlib import Path
 
 from .types import DocumentRecord
+from .classify import DOC_TYPE_SECTION
+from .chunk import maybe_chunk
 
 try:
     import pdfplumber          # type: ignore
@@ -159,17 +161,35 @@ def _is_temp_file(filename: str) -> bool:
 # Patterns scanned against the first ~2 000 chars of extracted text.
 # Each entry: (regex, doc_type)  — first match wins.
 _CONTENT_RULES: list[tuple[str, str]] = [
+    # ── Drawings ─────────────────────────────────────────────────────────────
     (r"drawing\s+index|sheet\s+index|revision\s+history.*dwg|drawing\s+list", "drawings"),
+
+    # ── Amendments — MUST come before solicitation ────────────────────────────
+    # Catches SF30 "Amendment of Solicitation/Modification of Contract" header,
+    # VA/DoD numbered-suffix files (36C77626B0013+0001), and standard amendment text.
+    (r"amendment\s+of\s+solicitation"
+     r"|modification\s+of\s+contract"
+     r"|amendment[/\s]+modification\s+number"
+     r"|this\s+(?:solicitation\s+is\s+)?amended\s+as\s+set\s+forth"
+     r"|amendment\s+(?:no\.?|number)?\s*\d+"
+     r"|this\s+amendment\s+modifies"
+     r"|sf[\s\-]?30\b",
+     "amendment"),
+
+    # ── Solicitation / specs ──────────────────────────────────────────────────
     (r"(?:section|div(?:ision)?)\s+0?1\s+\d{2}\s+\d{2}|project\s+manual|table\s+of\s+contents.*division", "solicitation"),
     (r"statement\s+of\s+work|scope\s+of\s+work|performance\s+work\s+statement", "solicitation"),
+    (r"technical\s+specifications?|division\s+\d+\s*[-–]\s*\w|section\s+\d{2}\s+\d{2}\s+\d{2}", "solicitation"),
     (r"wage\s+determination|davis.bacon|service\s+contract\s+act", "wage_determination"),
-    (r"amendment\s+(?:no\.?|number)?\s*\d+|this\s+amendment\s+modifies", "amendment"),
     (r"solicitation\s+(?:no\.?|number)|request\s+for\s+(?:proposal|quotation|bid)", "solicitation"),
     (r"past\s+performance\s+questionnaire|ppq", "past_performance"),
     (r"subcontracting\s+plan", "subcontracting_plan"),
     (r"infection\s+control\s+risk|pre.?construction\s+risk\s+assessment", "admin"),
+    (r"geotechnical\s+(?:report|investigation|evaluation)|soil\s+boring|subsurface\s+investigation", "admin"),
     (r"site\s+visit\s+(?:sign|instructions)|attendance\s+sheet", "admin"),
     (r"questions?\s+and\s+answers|technical\s+questions?\s+(?:and\s+)?responses?", "admin"),
+    (r"brand\s+name\s+justification|brand\s+name\s+or\s+equal", "admin"),
+    (r"tradeoff\s+(?:analysis|factor|instruction)|source\s+selection", "admin"),
 ]
 
 # RAG strategy by doc_type
@@ -269,7 +289,13 @@ def extract_all(
 
         text = ""
 
-        if rec.ext == ".pdf":
+        # Skip full text extraction for drawings — they are image-based PDFs
+        # that produce no useful text, waste many minutes, and are excluded from
+        # RAG anyway (rag_strategy = reference_only).  We still record page count
+        # by doing a lightweight open (no text extraction).
+        _skip_extraction = rec.doc_type == "drawings"
+
+        if rec.ext == ".pdf" and not _skip_extraction:
             source_path = rec.rendered_pdf if rec.rendered_pdf else rec.abs_path
             text, pages_meta, method = _extract_pdf(source_path)
             meta["extraction_method"]    = method
@@ -277,6 +303,17 @@ def extract_all(
             meta["total_chars"]          = len(text.strip())
             meta["has_extractable_text"] = len(text.strip()) > 50
             meta["pages"]                = pages_meta
+
+        elif rec.ext == ".pdf" and _skip_extraction:
+            # Lightweight page count only — no text extraction
+            meta["extraction_method"] = "skipped_drawings"
+            if _PDFPLUMBER:
+                try:
+                    import pdfplumber as _plumber
+                    with _plumber.open(rec.abs_path) as _pdf:
+                        meta["total_pages"] = len(_pdf.pages)
+                except Exception:
+                    pass
 
         elif rec.ext == ".docx" and _DOCX:
             try:
@@ -300,22 +337,33 @@ def extract_all(
             meta["extraction_method"] = "unsupported_format"
 
         # ── Content-based classification override ─────────────────────────
-        if rec.ext == ".pdf" and meta["has_extractable_text"]:
+        if rec.ext == ".pdf" and meta["has_extractable_text"] and not _skip_extraction:
             content_type = _content_classify(text, meta["pages"])
             meta["content_classification"] = content_type
 
             if content_type and content_type != meta["doc_type"]:
-                # Content signal wins over an unmatched filename; also
-                # always trust the landscape/drawings signal regardless.
-                if meta["classification_source"] == "unmatched" or content_type == "drawings":
+                # Content signal wins over an unmatched filename.
+                # Exception: amendment is always trusted over solicitation —
+                # SF30 forms are definitively amendments even if content also
+                # contains solicitation language (they reprint the solicitation).
+                # Drawings heuristic wins over unmatched filenames only.
+                is_unmatched = meta["classification_source"] == "unmatched"
+                is_amendment_upgrade = (
+                    content_type == "amendment"
+                    and meta["doc_type"] in ("solicitation", "unknown")
+                )
+                is_drawings_override = content_type == "drawings" and is_unmatched
+                if is_unmatched or is_amendment_upgrade or is_drawings_override:
                     meta["doc_type"] = content_type
                     meta["classification_source"] = "content"
-                    # Re-derive section for drawings
-                    if content_type == "drawings":
-                        meta["section"] = "11_Drawings"
+                    # Update section + sort_key from the doc_type→section map
+                    new_section, new_sort = DOC_TYPE_SECTION.get(content_type, ("99_Appendix", 999))
+                    meta["section"] = new_section
+                    meta["sort_key"] = new_sort
                     # Update dify fields to reflect new doc_type
                     meta["dify_doc_name"] = f"[{content_type.upper()}] {rec.filename}"
                     meta["dify_tags"][0] = content_type
+                    meta["dify_tags"][2] = new_section
             elif content_type:
                 # Content agreed with filename classification
                 meta["content_classification"] = content_type
@@ -323,8 +371,21 @@ def extract_all(
         # ── RAG strategy ──────────────────────────────────────────────────
         meta["rag_strategy"] = _RAG_STRATEGY.get(meta["doc_type"], "full")
 
-        (section_dir / f"{stem}.txt").write_text(text, encoding="utf-8")
-        (section_dir / f"{stem}.meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+        # Re-derive section_dir in case content classification changed the section
+        final_section_dir = extract_root / meta["section"]
+        final_section_dir.mkdir(parents=True, exist_ok=True)
+
+        txt_file  = final_section_dir / f"{stem}.txt"
+        meta_file = final_section_dir / f"{stem}.meta.json"
+
+        txt_file.write_text(text, encoding="utf-8")
+        meta_file.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+
+        # ── Split oversized files for Dify (400 000 char limit) ──────────────
+        chunk_list = maybe_chunk(txt_file, meta_file, meta)
+        if chunk_list:
+            # meta was updated in-place by maybe_chunk; re-read nothing needed
+            pass  # chunk files are already on disk alongside the parent .txt
 
     records[:] = kept
     return records
